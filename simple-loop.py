@@ -3,6 +3,7 @@
 """
 import os
 
+from pathlib import Path
 import dotenv
 from langchain.chat_models import init_chat_model
 import subprocess
@@ -11,6 +12,7 @@ from langchain_core.tools import tool
 from langchain_core.messages import ToolMessage, AIMessage
 
 dotenv.load_dotenv()
+WORKDIR = Path.cwd()
 
 api_key = os.getenv('DEEPSEEK_API_KEY')
 api_url = os.getenv('DEEPSEEK_API_URL')
@@ -50,9 +52,95 @@ def run_bash(command:str)-> str:
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
 
+#路径沙箱防止逃逸工作区
+def safe_path(path: str) -> str:
+    path = (WORKDIR / path).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {path}")
+    return path
+
+@tool
+def run_read(path: str, limit: int = None) -> str:
+    """
+    读取文件内容
+
+    Args:
+        path: 文件路径
+        limit: 读取行数限制，默认为 None
+
+    Returns:
+        文件内容字符串
+
+    Raises:
+        无显式抛出，但会捕获并返回文件错误
+    """
+    try:
+        text = safe_path(path).read_text()
+        lines = text.splitlines()
+        if limit and limit < len(lines):
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+        return "\n".join(lines)[:50000]
+    except Exception as e:
+        return f"Error: {e}"
+
+@tool
+def run_write(path: str, content: str) -> str:
+    """
+    写入文件内容
+
+    Args:
+        path: 文件路径
+        content: 文件内容字符串
+
+    Returns:
+        写入的字节数
+
+    Raises:
+        无显式抛出，但会捕获并返回文件错误
+    """
+    try:
+        fp = safe_path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content)
+        return f"Wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+@tool
+def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """
+    编辑文件内容
+
+    Args:
+        path: 文件路径
+        old_text: 要替换的旧文本
+        new_text: 替换的新文本
+
+    Returns:
+        编辑后的文件内容字符串
+
+    Raises:
+        无显式抛出，但会捕获并返回文件错误
+    """
+    try:
+        fp = safe_path(path)
+        content = fp.read_text()
+        if old_text not in content:
+            return f"Error: Text not found in {path}"
+        fp.write_text(content.replace(old_text, new_text, 1))
+        return f"Edited {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+TOOL_HANDLERS = {
+    "run_bash":  run_bash,
+    "run_read":  run_read,
+    "run_write": run_write,
+    "run_edit":  run_edit,
+}
 
 
-llm_with_tools = llm.bind_tools([run_bash])
+llm_with_tools = llm.bind_tools([run_bash, run_read, run_write, run_edit])
 
 
 def agent_loop(messages: list) -> str:
@@ -84,8 +172,11 @@ def agent_loop(messages: list) -> str:
         # 处理工具调用
         for tool_call in response.tool_calls:
             print(f"\n> 运行工具: {tool_call['name']}")
-            tool_output = run_bash.invoke(tool_call['args'])
-
+            handler = TOOL_HANDLERS.get(tool_call['name'])
+            if handler is None:
+                tool_output = f"Error: Unknown tool '{tool_call['name']}'"
+            else:
+                tool_output = handler.invoke(tool_call['args'])
             # 添加工具结果消息
             tool_messages.append(ToolMessage(
                 content=tool_output,
@@ -108,7 +199,7 @@ if __name__ == '__main__':
     history = []
     while True:
     #获取输入
-        user_input = input()
+        user_input = input("请输入: ")
         if user_input == 'exit':
              print('bye')
              exit()
