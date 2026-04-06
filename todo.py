@@ -2,27 +2,119 @@
 简单claude code实现
 """
 import os
-
+import json
+import logging
+from datetime import datetime
 from pathlib import Path
 import dotenv
+from langchain.agents.middleware import todo
 from langchain.chat_models import init_chat_model
 import subprocess
 
+
 from langchain_core.tools import tool
-from langchain_core.messages import ToolMessage, AIMessage, SystemMessage
+from langchain_core.messages import ToolMessage, AIMessage, HumanMessage, SystemMessage, system
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('llm_requests.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 dotenv.load_dotenv()
 WORKDIR = Path.cwd()
-
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Prefer tools over prose."""
 api_key = os.getenv('DEEPSEEK_API_KEY')
 api_url = os.getenv('DEEPSEEK_API_URL')
 MODEL_ID = os.getenv('MODULE_ID')
 llm = init_chat_model(
     model=MODEL_ID,
     api_key=api_key,
-    base_url=api_url,
+    base_url=api_url
 )
 
+
+class TodoManager:
+    def __init__(self):
+        self.items = []
+
+    def update(self, items: list) -> str:
+        """更新待办事项列表（内部方法，非工具）"""
+        validated, in_progress_count = [], 0
+        for item in items:
+            status = item.get("status", "pending")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"id": item["id"], "text": item["text"],
+                              "status": status})
+        if in_progress_count > 1:
+            raise ValueError("Only one task can be in_progress")
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        if not self.items:
+            return "No todos."
+        lines = []
+        for item in self.items:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+        done = sum(1 for t in self.items if t["status"] == "completed")
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+TODO = TodoManager()
+
+
+@tool("todo")
+def todo_tool(items: list) -> str:
+    """
+    更新待办事项列表
+
+    Args:
+        items: 待办事项列表，每项包含 id、text 和 status (pending/in_progress/completed)
+
+    Returns:
+        更新后的待办事项列表字符串
+
+    Example:
+        items = [
+            {"id": "1", "text": "读取文件", "status": "in_progress"},
+            {"id": "2", "text": "修改代码", "status": "pending"}
+        ]
+    """
+    return TODO.update(items)
+
+
+def log_messages(messages: list, prefix: str = ""):
+    """记录消息列表到日志"""
+    log_data = []
+    for msg in messages:
+        if isinstance(msg, SystemMessage):
+            log_data.append({"role": "system", "content": msg.content[:200] + "..." if len(msg.content) > 200 else msg.content})
+        elif isinstance(msg, HumanMessage):
+            log_data.append({"role": "user", "content": msg.content[:500] + "..." if len(msg.content) > 500 else msg.content})
+        elif isinstance(msg, AIMessage):
+            entry = {"role": "assistant", "content": msg.content}
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                entry["tool_calls"] = msg.tool_calls
+            log_data.append(entry)
+        elif isinstance(msg, ToolMessage):
+            log_data.append({"role": "tool", "content": msg.content[:200] + "..." if len(msg.content) > 200 else msg.content, "tool_call_id": msg.tool_call_id})
+        elif isinstance(msg, dict):
+            content = msg.get("content", "")
+            if isinstance(content, str) and len(content) > 500:
+                content = content[:500] + "..."
+            log_data.append({"role": msg.get("role", "unknown"), "content": content})
+
+    logger.info(f"{prefix}\n{json.dumps(log_data, ensure_ascii=False, indent=2)}")
 @tool
 def run_bash(command:str)-> str:
     """
@@ -137,26 +229,13 @@ TOOL_HANDLERS = {
     "run_read":  run_read,
     "run_write": run_write,
     "run_edit":  run_edit,
+    "todo": todo_tool
 }
 
 
-llm_with_tools = llm.bind_tools([run_bash, run_read, run_write, run_edit])
+llm_with_tools = llm.bind_tools([run_bash, run_read, run_write, run_edit, todo_tool])
 
-# 系统提示词 - 定义助手的行为和角色
-SYSTEM_PROMPT = """你是一个专业的编程助手，擅长编写Python代码。
-
-你可以使用以下工具来帮助用户：
-- run_bash: 执行bash命令
-- run_read: 读取文件内容
-- run_write: 写入文件内容
-- run_edit: 编辑文件内容
-
-请遵循以下规则：
-1. 在操作文件前，先读取了解内容
-2. 危险操作（如删除系统文件）会被阻止
-3. 操作完成后向用户解释你做了什么
-"""
-
+#添加系统提示词
 
 def agent_loop(messages: list) -> str:
     """
@@ -168,12 +247,23 @@ def agent_loop(messages: list) -> str:
     Returns:
         最终的 LLM 响应内容
     """
-    # 确保消息列表以 SystemMessage 开头
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages.insert(0, SystemMessage(content=SYSTEM_PROMPT))
+    system_message = SystemMessage(content=SYSTEM)
+    messages.append(system_message)
 
+    rounds_since_todo = 0
     while True:
+        # 记录请求
+        log_messages(messages, prefix="=== LLM Request ===")
+
         response = llm_with_tools.invoke(messages)
+
+        # 记录响应
+        response_data = {
+            "content": response.content,
+            "tool_calls": response.tool_calls if hasattr(response, 'tool_calls') else [],
+            "usage": response.usage_metadata if hasattr(response, 'usage_metadata') else None
+        }
+        logger.info(f"=== LLM Response ===\n{json.dumps(response_data, ensure_ascii=False, indent=2)}")
         # 如果没有工具调用，直接返回响应
         if not response.tool_calls:
             messages.append(AIMessage(content=response.content))
@@ -189,6 +279,7 @@ def agent_loop(messages: list) -> str:
         tool_messages = []
 
         # 处理工具调用
+        used_todo = False
         for tool_call in response.tool_calls:
             print(f"\n> 运行工具: {tool_call['name']}")
             handler = TOOL_HANDLERS.get(tool_call['name'])
@@ -200,6 +291,13 @@ def agent_loop(messages: list) -> str:
             tool_messages.append(ToolMessage(
                 content=tool_output,
                 tool_call_id=tool_call['id']
+            ))
+            if tool_call['name'] == 'todo':
+                used_todo = True
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        if rounds_since_todo >= 3:
+            tool_messages.append(HumanMessage(
+                content="<reminder>Update your todos.</reminder>",
             ))
 
         # 添加所有工具结果消息
